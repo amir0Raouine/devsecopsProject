@@ -541,6 +541,77 @@ jobs:
           docker logs juice-shop-staging
           exit 1
 
+      - name: Remove old Docker Hub tags after successful staging test
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          python3 - <<'PYCODE'
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          namespace = os.environ["DOCKERHUB_USERNAME"]
+          secret = os.environ["DOCKERHUB_TOKEN"]
+          current = os.environ["GITHUB_SHA"]
+          repository = "juice-shop-devsecops"
+          base = (
+              "https://hub.docker.com/v2/namespaces/"
+              f"{urllib.parse.quote(namespace, safe='')}/repositories/"
+              f"{repository}/tags"
+          )
+
+          def request_json(url, method="GET", payload=None, token=None):
+              headers = {"Accept": "application/json"}
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+              data = None
+              if payload is not None:
+                  headers["Content-Type"] = "application/json"
+                  data = json.dumps(payload).encode("utf-8")
+              req = urllib.request.Request(
+                  url, data=data, headers=headers, method=method
+              )
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  if response.status == 204:
+                      return None
+                  body = response.read()
+                  return json.loads(body) if body else None
+
+          credentials = request_json(
+              "https://hub.docker.com/v2/auth/token",
+              method="POST",
+              payload={"identifier": namespace, "secret": secret},
+          )
+          token = credentials["access_token"]
+
+          tags = []
+          next_url = f"{base}?page_size=100"
+          while next_url:
+              parsed = urllib.parse.urlparse(next_url)
+              if parsed.scheme != "https" or parsed.hostname != "hub.docker.com":
+                  raise RuntimeError("Unexpected Docker Hub pagination URL")
+              page = request_json(next_url, token=token)
+              tags.extend(item["name"] for item in page["results"])
+              next_url = page.get("next")
+
+          # Ne jamais supprimer d'anciens tags si le nouveau manque.
+          if current not in tags:
+              raise RuntimeError("New image tag not found; cleanup aborted")
+
+          old_tags = [tag for tag in tags if tag != current]
+          print(f"Current tag retained: {current}")
+          print(f"Old tags to delete: {len(old_tags)}")
+          for tag in old_tags:
+              endpoint = f"{base}/{urllib.parse.quote(tag, safe='')}"
+              request_json(endpoint, method="DELETE", token=token)
+              print(f"Deleted old tag: {tag}")
+
+          print("Docker Hub cleanup completed")
+          PYCODE
+
       - name: Remove staging container
         if: always()
         run: docker rm -f juice-shop-staging || true
