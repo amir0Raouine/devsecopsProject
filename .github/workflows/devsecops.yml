@@ -473,6 +473,7 @@ jobs:
           docker network rm zapnet || true
 
   publish_image:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
     name: Publish Docker Image to Docker Hub
     runs-on: ubuntu-24.04
     needs: [docker_scan, sbom, dast]
@@ -504,6 +505,7 @@ jobs:
           echo "Published: $IMAGE"
 
   deploy_staging:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
     name: Deploy Staging - Docker Smoke Test
     runs-on: ubuntu-24.04
     needs: publish_image
@@ -569,6 +571,7 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           NEEDS_JSON: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           REPOSITORY: ${{ github.repository }}
         run: |
@@ -579,15 +582,19 @@ jobs:
 
           jobs = json.loads(os.environ["NEEDS_JSON"])
 
+          expected_skips = (
+              {"publish_image", "deploy_staging"}
+              if os.environ["EVENT_NAME"] == "pull_request"
+              else set()
+          )
+
           failed = [
               name for name, data in jobs.items()
-              if data["result"] in ("failure", "cancelled")
+              if data["result"] != "success"
+              and not (name in expected_skips and data["result"] == "skipped")
           ]
 
-          success = all(
-              data["result"] == "success"
-              for data in jobs.values()
-          )
+          success = not failed
 
           status = "SUCCESS" if success else "FAILED"
           symbol = ":white_check_mark:" if success else ":x:"
