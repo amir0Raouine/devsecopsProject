@@ -473,6 +473,7 @@ jobs:
           docker network rm zapnet || true
 
   publish_image:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     name: Publish Docker Image to Docker Hub
     runs-on: ubuntu-24.04
     needs: [docker_scan, sbom, dast]
