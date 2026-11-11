@@ -544,7 +544,7 @@ jobs:
       - name: Remove old Docker Hub tags after successful staging test
         env:
           DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_CLEANUP_TOKEN: ${{ secrets.DOCKERHUB_CLEANUP_TOKEN }}
         run: |
           python3 - <<'PYCODE'
           import json
@@ -554,7 +554,9 @@ jobs:
           import urllib.request
 
           namespace = os.environ["DOCKERHUB_USERNAME"]
-          secret = os.environ["DOCKERHUB_TOKEN"]
+          secret = os.environ["DOCKERHUB_CLEANUP_TOKEN"]
+          if not secret:
+              raise RuntimeError("Missing DOCKERHUB_CLEANUP_TOKEN GitHub secret")
           current = os.environ["GITHUB_SHA"]
           repository = "juice-shop-devsecops"
           base = (
@@ -580,11 +582,21 @@ jobs:
                   body = response.read()
                   return json.loads(body) if body else None
 
-          credentials = request_json(
-              "https://hub.docker.com/v2/auth/token",
-              method="POST",
-              payload={"identifier": namespace, "secret": secret},
-          )
+          try:
+              credentials = request_json(
+                  "https://hub.docker.com/v2/auth/token",
+                  method="POST",
+                  payload={"identifier": namespace, "secret": secret},
+              )
+          except urllib.error.HTTPError as error:
+              if error.code == 401:
+                  raise RuntimeError(
+                      "Docker Hub authentication rejected (401). Verify that "
+                      "DOCKERHUB_CLEANUP_TOKEN is an active Docker Hub PAT "
+                      "with Repo Read, Write, Delete permissions and that "
+                      "DOCKERHUB_USERNAME matches its Docker ID."
+                  ) from None
+              raise
           token = credentials["access_token"]
 
           tags = []
