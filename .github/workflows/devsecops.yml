@@ -698,4 +698,173 @@ jobs:
               print("Slack notification sent:", response.status)
           PY
 
+  security_reporting:
+    name: Grafana Loki - Security Reporting
+    runs-on: ubuntu-24.04
+    # Collect reports even when a security gate rejects the build.
+    if: ${{ always() }}
+    needs: [sca, iac_scan, docker_scan, dast]
 
+    steps:
+      - name: Download Trivy SCA report (if available)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: trivy-sca-report
+          path: security-reports/sca
+
+      - name: Download Trivy Docker report (if available)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: trivy-docker-report
+          path: security-reports/docker
+
+      - name: Download Checkov report (if available)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: checkov-iac-report
+          path: security-reports/checkov
+
+      - name: Download ZAP report (if available)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: zap-dast-reports
+          path: security-reports/zap
+
+      - name: Export aggregated security findings to Grafana Loki
+        # Observability must never turn a passing Quality Gate into a failure.
+        continue-on-error: true
+        env:
+          GRAFANA_LOKI_URL: ${{ secrets.GRAFANA_LOKI_URL }}
+          GRAFANA_LOKI_USER: ${{ secrets.GRAFANA_LOKI_USER }}
+          GRAFANA_LOKI_TOKEN: ${{ secrets.GRAFANA_LOKI_TOKEN }}
+          SCAN_RESULTS: ${{ toJSON(needs) }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PYCODE'
+          import base64
+          import collections
+          import json
+          import os
+          from pathlib import Path
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          root = Path('security-reports')
+          needs = json.loads(os.environ['SCAN_RESULTS'])
+          severity_names = ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL')
+          specs = (
+              ('trivy_sca', 'sca', root / 'sca/trivy-sca-report.json'),
+              ('trivy_docker', 'docker_scan', root / 'docker/trivy-docker-report.json'),
+              ('checkov', 'iac_scan', root / 'checkov/checkov-report.json'),
+              ('zap', 'dast', root / 'zap/zap-report.json'),
+          )
+
+          def count_findings(scanner, document):
+              counts = collections.Counter()
+              if scanner.startswith('trivy_'):
+                  if not isinstance(document, dict) or not isinstance(document.get('Results'), list):
+                      raise ValueError('Trivy Results missing or invalid')
+                  for result in document['Results']:
+                      for vuln in result.get('Vulnerabilities') or []:
+                          level = str(vuln.get('Severity', '')).upper()
+                          if level in severity_names:
+                              counts[level] += 1
+              elif scanner == 'checkov':
+                  reports = document if isinstance(document, list) else [document]
+                  if not reports or any(not isinstance(r, dict) or not isinstance(r.get('results'), dict) for r in reports):
+                      raise ValueError('Checkov results missing or invalid')
+                  # Checkov findings here do not all carry a reliable severity.
+                  counts['FAILED_CHECKS'] = sum(
+                      len(r['results'].get('failed_checks') or []) for r in reports
+                  )
+              elif scanner == 'zap':
+                  if not isinstance(document, dict) or not isinstance(document.get('site'), list):
+                      raise ValueError('ZAP site list missing or invalid')
+                  risks = {'0': 'INFO', '1': 'LOW', '2': 'MEDIUM', '3': 'HIGH'}
+                  for site in document['site']:
+                      for alert in site.get('alerts') or []:
+                          level = risks.get(str(alert.get('riskcode')))
+                          if level:
+                              counts[level] += 1
+              return counts
+
+          entries = []
+          now = time.time_ns()
+          for index, (scanner, job_name, path) in enumerate(specs):
+              event = {
+                  'scanner': scanner,
+                  'repository': os.environ['REPOSITORY'],
+                  'run_id': os.environ['RUN_ID'],
+                  'run_attempt': os.environ['RUN_ATTEMPT'],
+                  'run_url': os.environ['RUN_URL'],
+                  'commit': os.environ['COMMIT_SHA'],
+                  'event': os.environ['EVENT_NAME'],
+                  'job_result': needs.get(job_name, {}).get('result', 'unknown'),
+                  'report_status': 'missing',
+                  'low': None, 'medium': None,
+                  'high': None, 'critical': None,
+                  'info': None, 'failed_checks': None,
+              }
+              if path.is_file():
+                  try:
+                      document = json.loads(path.read_text(encoding='utf-8'))
+                      counts = count_findings(scanner, document)
+                      event.update({
+                          'report_status': 'available',
+                          'low': counts['LOW'],
+                          'medium': counts['MEDIUM'],
+                          'high': counts['HIGH'],
+                          'critical': counts['CRITICAL'],
+                          'info': counts['INFO'],
+                          'failed_checks': counts['FAILED_CHECKS'] if scanner == 'checkov' else None,
+                      })
+                  except (ValueError, OSError, TypeError) as exc:
+                      event['report_status'] = 'invalid'
+                      print(f'{scanner}: unreadable report: {exc}')
+              print(f"{scanner}: job={event['job_result']} report={event['report_status']} high={event['high']} critical={event['critical']}")
+              entries.append({
+                  'stream': {'job': 'devsecops_security', 'scanner': scanner},
+                  'values': [[str(now + index), json.dumps(event, separators=(',', ':'))]],
+              })
+
+          url = os.environ.get('GRAFANA_LOKI_URL', '').strip().rstrip('/')
+          user = os.environ.get('GRAFANA_LOKI_USER', '').strip()
+          token = os.environ.get('GRAFANA_LOKI_TOKEN', '').strip()
+          if not (url and user and token):
+              raise RuntimeError('Missing Grafana Loki credentials (URL / USER / TOKEN)')
+          if not url.endswith('/loki/api/v1/push'):
+              url += '/loki/api/v1/push'
+          parsed = urllib.parse.urlsplit(url)
+          if parsed.scheme != 'https' or not parsed.hostname or parsed.query or parsed.fragment:
+              raise ValueError('GRAFANA_LOKI_URL must be an HTTPS Loki ingestion URL')
+
+          credentials = base64.b64encode(f'{user}:{token}'.encode()).decode('ascii')
+          request = urllib.request.Request(
+              url,
+              data=json.dumps({'streams': entries}).encode('utf-8'),
+              headers={
+                  'Content-Type': 'application/json',
+                  'Authorization': 'Basic ' + credentials,
+              },
+              method='POST',
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  if response.status not in (200, 204):
+                      raise RuntimeError(f'Unexpected Loki HTTP status: {response.status}')
+                  print('Grafana Loki: 4 security summaries sent successfully')
+          except urllib.error.HTTPError as exc:
+              # Do not print response bodies, tokens or request headers.
+              raise RuntimeError(f'Grafana Loki HTTP error {exc.code}; check Loki URL, instance ID and logs:write token') from None
+          PYCODE
